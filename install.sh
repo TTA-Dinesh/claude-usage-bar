@@ -25,13 +25,14 @@ echo "✓  Python 3 found at $PYTHON"
 
 # ── 2. Install Python dependencies ────────────────────────────────────────────
 echo "→  Installing Python dependencies…"
-$PYTHON -m pip install --quiet --upgrade rumps requests pyobjc-framework-Cocoa
+$PYTHON -m pip install --quiet --upgrade rumps requests pyobjc-framework-Cocoa pywebview
 echo "✓  Dependencies installed"
 
 # ── 3. Download app ───────────────────────────────────────────────────────────
 echo "→  Downloading app to $INSTALL_DIR…"
 mkdir -p "$INSTALL_DIR"
-curl -fsSL "$REPO/app.py" -o "$INSTALL_DIR/app.py"
+curl -fsSL "$REPO/app.py"    -o "$INSTALL_DIR/app.py"
+curl -fsSL "$REPO/login.py"  -o "$INSTALL_DIR/login.py"
 
 # Create empty config if one doesn't already exist
 if [ ! -f "$INSTALL_DIR/config.json" ]; then

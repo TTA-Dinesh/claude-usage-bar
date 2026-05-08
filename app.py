@@ -2,12 +2,15 @@ import rumps
 import requests
 import json
 import threading
+import subprocess
+import sys
+import os
 from datetime import datetime, timezone
 
 # ── Config ────────────────────────────────────────────────────────────────────
-CONFIG_FILE = "config.json"
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 API_URL = "https://claude.ai/api/organizations/e682e130-7a2e-4833-8553-67c0b0bc0ed0/usage"
-REFRESH_INTERVAL = 300  # seconds (5 minutes)
+REFRESH_INTERVAL = 300  # 5 minutes
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -25,7 +28,6 @@ def save_config(data):
 
 
 def time_until(iso_str):
-    """Return human-readable time until a UTC ISO timestamp."""
     if not iso_str:
         return "—"
     try:
@@ -42,7 +44,6 @@ def time_until(iso_str):
 
 
 def pct_bar(pct, width=10):
-    """Simple ASCII progress bar, e.g. ████░░░░░░"""
     filled = round(pct / 100 * width)
     return "█" * filled + "░" * (width - filled)
 
@@ -50,18 +51,22 @@ def pct_bar(pct, width=10):
 # ── App ───────────────────────────────────────────────────────────────────────
 class ClaudeUsageBar(rumps.App):
     def __init__(self):
-        super().__init__("Claude —")
+        super().__init__("Claude")
         config = load_config()
         self.session_key = config.get("session_key", "")
+        self.usage_timer = None
 
-        # Build menu items (keep references so we can update titles)
+        # ── Menu items ────────────────────────────────────────────────────────
         self.item_session     = rumps.MenuItem("Session:  —")
         self.item_session_bar = rumps.MenuItem("")
-        self.item_session_rst = rumps.MenuItem("Resets in: —")
+        self.item_session_rst = rumps.MenuItem("  Resets in: —")
         self.item_weekly      = rumps.MenuItem("Weekly:   —")
         self.item_weekly_bar  = rumps.MenuItem("")
-        self.item_weekly_rst  = rumps.MenuItem("Weekly resets: —")
-        self.item_status      = rumps.MenuItem("Last updated: —")
+        self.item_weekly_rst  = rumps.MenuItem("  Resets in: —")
+        self.item_status      = rumps.MenuItem("—")
+        self.item_signin      = rumps.MenuItem("🔐  Sign in to Claude…", callback=self.sign_in)
+        self.item_signout     = rumps.MenuItem("Sign Out", callback=self.sign_out)
+        self.item_refresh     = rumps.MenuItem("↻  Refresh Now", callback=self.manual_refresh)
 
         self.menu = [
             self.item_session,
@@ -74,26 +79,35 @@ class ClaudeUsageBar(rumps.App):
             None,
             self.item_status,
             None,
-            rumps.MenuItem("↻ Refresh Now", callback=self.manual_refresh),
-            rumps.MenuItem("⚙ Set Session Cookie…", callback=self.set_cookie),
+            self.item_refresh,
+            self.item_signin,
+            self.item_signout,
         ]
 
-        # Kick off first fetch, then repeat on timer
-        self._fetch()
-        self.timer = rumps.Timer(lambda _: self._fetch(), REFRESH_INTERVAL)
-        self.timer.start()
+        # ── Boot state ────────────────────────────────────────────────────────
+        if self.session_key:
+            self._start_usage_polling()
+        else:
+            self._set_signed_out_state()
 
-    # ── Data fetching ──────────────────────────────────────────────────────────
+        # Always poll config.json every 2s to detect login completion
+        self.login_watcher = rumps.Timer(self._check_for_login, 2)
+        self.login_watcher.start()
+
+    # ── Polling ───────────────────────────────────────────────────────────────
+    def _start_usage_polling(self):
+        self._fetch()
+        if self.usage_timer:
+            self.usage_timer.stop()
+        self.usage_timer = rumps.Timer(lambda _: self._fetch(), REFRESH_INTERVAL)
+        self.usage_timer.start()
+
     def _fetch(self):
-        """Fetch usage in a background thread to avoid blocking the UI."""
         threading.Thread(target=self._do_fetch, daemon=True).start()
 
     def _do_fetch(self):
         if not self.session_key:
-            self.title = "Claude ⚠"
-            self.item_status.title = "⚠ No session cookie set"
             return
-
         try:
             resp = requests.get(
                 API_URL,
@@ -104,11 +118,17 @@ class ClaudeUsageBar(rumps.App):
                 },
                 timeout=10,
             )
+            if resp.status_code == 401:
+                self.session_key = ""
+                save_config({"session_key": ""})
+                self._set_signed_out_state()
+                self.item_status.title = "⚠ Session expired — please sign in again"
+                return
             resp.raise_for_status()
             self._update_ui(resp.json())
         except requests.HTTPError as e:
             self.title = "Claude ✗"
-            self.item_status.title = f"Error: {e.response.status_code}"
+            self.item_status.title = f"Error {e.response.status_code}"
         except Exception as e:
             self.title = "Claude ✗"
             self.item_status.title = f"Error: {e}"
@@ -120,45 +140,55 @@ class ClaudeUsageBar(rumps.App):
         s_pct = five.get("utilization", 0) or 0
         w_pct = seven.get("utilization", 0) or 0
 
-        # Menubar title
         self.title = f"Claude {int(s_pct)}%"
 
-        # Session block
         self.item_session.title     = f"Session:  {int(s_pct)}%"
         self.item_session_bar.title = f"  {pct_bar(s_pct)}"
         self.item_session_rst.title = f"  Resets in {time_until(five.get('resets_at'))}"
 
-        # Weekly block
         self.item_weekly.title      = f"Weekly:   {int(w_pct)}%"
         self.item_weekly_bar.title  = f"  {pct_bar(w_pct)}"
         self.item_weekly_rst.title  = f"  Resets in {time_until(seven.get('resets_at'))}"
 
-        # Footer
-        now = datetime.now().strftime("%H:%M")
-        self.item_status.title = f"Updated {now}"
+        self.item_status.title = f"Updated {datetime.now().strftime('%H:%M')}"
 
-    # ── Callbacks ──────────────────────────────────────────────────────────────
+    # ── Login watcher ─────────────────────────────────────────────────────────
+    def _check_for_login(self, _):
+        """Detect when login.py writes a new sessionKey to config.json."""
+        config = load_config()
+        new_key = config.get("session_key", "")
+        if new_key and new_key != self.session_key:
+            self.session_key = new_key
+            self.item_status.title = "Signed in — fetching usage…"
+            self._start_usage_polling()
+
+    # ── Callbacks ─────────────────────────────────────────────────────────────
+    def sign_in(self, _):
+        self.item_status.title = "Opening sign-in window…"
+        login_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "login.py")
+        subprocess.Popen([sys.executable, login_script])
+
+    def sign_out(self, _):
+        self.session_key = ""
+        save_config({"session_key": ""})
+        if self.usage_timer:
+            self.usage_timer.stop()
+        self._set_signed_out_state()
+
     def manual_refresh(self, _):
         self.item_status.title = "Refreshing…"
         self._fetch()
 
-    def set_cookie(self, _):
-        win = rumps.Window(
-            title="Session Cookie",
-            message=(
-                "Paste your sessionKey cookie value.\n\n"
-                "Get it from: DevTools → Application → Cookies → claude.ai → sessionKey"
-            ),
-            default_text=self.session_key,
-            ok="Save",
-            cancel="Cancel",
-            dimensions=(420, 60),
-        )
-        response = win.run()
-        if response.clicked:
-            self.session_key = response.text.strip()
-            save_config({"session_key": self.session_key})
-            self._fetch()
+    # ── UI states ─────────────────────────────────────────────────────────────
+    def _set_signed_out_state(self):
+        self.title = "Claude"
+        self.item_session.title     = "Session:  —"
+        self.item_session_bar.title = ""
+        self.item_session_rst.title = "  Resets in: —"
+        self.item_weekly.title      = "Weekly:   —"
+        self.item_weekly_bar.title  = ""
+        self.item_weekly_rst.title  = "  Resets in: —"
+        self.item_status.title      = "Sign in to see your usage"
 
 
 if __name__ == "__main__":
